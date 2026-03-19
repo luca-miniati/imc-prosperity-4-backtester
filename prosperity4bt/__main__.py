@@ -4,16 +4,20 @@ from collections import defaultdict
 from datetime import datetime
 from functools import reduce
 from importlib import import_module, metadata, reload
+from itertools import product
 from pathlib import Path
 from typing import Annotated, Any, Optional
 
+import yaml
+from tqdm import tqdm
+import typer
 from typer import Argument, Option, Typer
 
 from prosperity4bt.data import has_day_data
 from prosperity4bt.file_reader import FileReader, FileSystemReader, PackageResourcesReader
 from prosperity4bt.models import BacktestResult, TradeMatchingMode
 from prosperity4bt.open import open_visualizer
-from prosperity4bt.runner import run_backtest
+from prosperity4bt.runner import _run_backtest_single_day, run_backtest
 
 
 def parse_algorithm(algorithm: Path) -> Any:
@@ -28,37 +32,13 @@ def parse_data(data_root: Optional[Path]) -> FileReader:
         return PackageResourcesReader()
 
 
-def parse_days(file_reader: FileReader, days: list[str]) -> list[tuple[int, int]]:
-    parsed_days = []
-
-    for arg in days:
-        if "-" in arg:
-            round_num, day_num = map(int, arg.split("-", 1))
-
-            if not has_day_data(file_reader, round_num, day_num):
-                print(f"Warning: no data found for round {round_num} day {day_num}")
-                continue
-
-            parsed_days.append((round_num, day_num))
-        else:
-            round_num = int(arg)
-
-            parsed_days_in_round = []
-            for day_num in range(-5, 100):
-                if has_day_data(file_reader, round_num, day_num):
-                    parsed_days_in_round.append((round_num, day_num))
-
-            if len(parsed_days_in_round) == 0:
-                print(f"Warning: no data found for round {round_num}")
-                continue
-
-            parsed_days.extend(parsed_days_in_round)
-
-    if len(parsed_days) == 0:
-        print("Error: did not find data for any requested round/day")
-        sys.exit(1)
-
-    return parsed_days
+def get_days_for_round(file_reader: FileReader, round_num: int) -> list[tuple[int, int]]:
+    """Return all (round_num, day_num) pairs that have data for the given round."""
+    days = []
+    for day_num in range(-5, 100):
+        if has_day_data(file_reader, round_num, day_num):
+            days.append((round_num, day_num))
+    return days
 
 
 def parse_out(out: Optional[Path], no_out: bool) -> Optional[Path]:
@@ -203,22 +183,23 @@ def version_callback(value: bool) -> None:
 
 app = Typer(context_settings={"help_option_names": ["--help", "-h"]})
 
+KNOWN_COMMANDS = {"grid-search"}
 
-@app.command()
-def cli(
-    algorithm: Annotated[Path, Argument(help="Path to the Python file containing the algorithm to backtest.", show_default=False, exists=True, file_okay=True, dir_okay=False, resolve_path=True)],
-    days: Annotated[list[str], Argument(help="The days to backtest on. <round>-<day> for a single day, <round> for all days in a round.", show_default=False)],
-    merge_pnl: Annotated[bool, Option("--merge-pnl", help="Merge profit and loss across days.")] = False,
-    vis: Annotated[bool, Option("--vis", help="Open backtest results in https://jmerle.github.io/imc-prosperity-3-visualizer/ when done.")] = False,
-    out: Annotated[Optional[Path], Option(help="File to save output log to (defaults to backtests/<timestamp>.log).", show_default=False, dir_okay=False, resolve_path=True)] = None,
-    no_out: Annotated[bool, Option("--no-out", help="Skip saving output log.")] = False,
-    data: Annotated[Optional[Path], Option(help="Path to data directory. Must look similar in structure to https://github.com/jmerle/imc-prosperity-3-backtester/tree/master/prosperity4bt/resources.", show_default=False, exists=True, file_okay=False, dir_okay=True, resolve_path=True)] = None,
-    print_output: Annotated[bool, Option("--print", help="Print the trader's output to stdout while it's running.")] = False,
-    match_trades: Annotated[TradeMatchingMode, Option(help="How to match orders against market trades. 'all' matches trades with prices equal to or worse than your quotes, 'worse' matches trades with prices worse than your quotes, 'none' does not match trades against orders at all.")] = TradeMatchingMode.all,
-    no_progress: Annotated[bool, Option("--no-progress", help="Don't show progress bars.")] = False,
-    original_timestamps: Annotated[bool, Option("--original-timestamps", help="Preserve original timestamps in output log rather than making them increase across days.")] = False,
-    version: Annotated[bool, Option("--version", "-v", help="Show the program's version number and exit.", is_eager=True, callback=version_callback)] = False,
-) -> None:  # fmt: skip
+
+def _run_backtest_cli(
+    algorithm: Path,
+    round_num: int,
+    merge_pnl: bool,
+    vis: bool,
+    out: Optional[Path],
+    no_out: bool,
+    data: Optional[Path],
+    print_output: bool,
+    match_trades: TradeMatchingMode,
+    no_progress: bool,
+    original_timestamps: bool,
+) -> None:
+    """Run the backtest CLI logic."""
     if out is not None and no_out:
         print("Error: --out and --no-out are mutually exclusive")
         sys.exit(1)
@@ -234,21 +215,24 @@ def cli(
         sys.exit(1)
 
     file_reader = parse_data(data)
-    parsed_days = parse_days(file_reader, days)
+    parsed_days = get_days_for_round(file_reader, round_num)
+    if not parsed_days:
+        print(f"Error: no data found for round {round_num}")
+        sys.exit(1)
     output_file = parse_out(out, no_out)
 
     show_progress_bars = not no_progress and not print_output
 
     results = []
-    for round_num, day_num in parsed_days:
-        print(f"Backtesting {algorithm} on round {round_num} day {day_num}")
+    for rnd, day_num in parsed_days:
+        print(f"Backtesting {algorithm} on round {rnd} day {day_num}")
 
         reload(trader_module)
 
-        result = run_backtest(
+        result = _run_backtest_single_day(
             trader_module.Trader(),
             file_reader,
-            round_num,
+            rnd,
             day_num,
             print_output,
             match_trades,
@@ -274,7 +258,156 @@ def cli(
         open_visualizer(output_file)
 
 
+@app.command("run")
+def run(
+    algorithm: Annotated[Path, Argument(help="Path to the Python file containing the algorithm to backtest.", show_default=False, exists=True, file_okay=True, dir_okay=False, resolve_path=True)],
+    round_num: Annotated[int, Argument(help="Round number to backtest (0–6). Backtests all days in the round.")],
+    merge_pnl: Annotated[bool, Option("--merge-pnl", help="Merge profit and loss across days.")] = False,
+    vis: Annotated[bool, Option("--vis", help="Open backtest results in https://jmerle.github.io/imc-prosperity-3-visualizer/ when done.")] = False,
+    out: Annotated[Optional[Path], Option(help="File to save output log to (defaults to backtests/<timestamp>.log).", show_default=False, dir_okay=False, resolve_path=True)] = None,
+    no_out: Annotated[bool, Option("--no-out", help="Skip saving output log.")] = False,
+    data: Annotated[Optional[Path], Option(help="Path to data directory.", show_default=False, exists=True, file_okay=False, dir_okay=True, resolve_path=True)] = None,
+    print_output: Annotated[bool, Option("--print", help="Print the trader's output to stdout while it's running.")] = False,
+    match_trades: Annotated[TradeMatchingMode, Option(help="How to match orders against market trades.")] = TradeMatchingMode.all,
+    no_progress: Annotated[bool, Option("--no-progress", help="Don't show progress bars.")] = False,
+    original_timestamps: Annotated[bool, Option("--original-timestamps", help="Preserve original timestamps in output log.")] = False,
+) -> None:  # fmt: skip
+    """Backtest a Prosperity algorithm on all days in a round."""
+    _run_backtest_cli(
+        algorithm, round_num, merge_pnl, vis, out, no_out, data,
+        print_output, match_trades, no_progress, original_timestamps,
+    )
+
+
+def _config_to_trader_params(symbol_params: dict[str, Any], param_order: list[str]) -> list:
+    """Convert {quantity: 60, inv_reset: 70, penny: 0} to [60, 70, 0] using param_order."""
+    return [symbol_params[key] for key in param_order if key in symbol_params]
+
+
+def _grid_config_to_combos(config: dict[str, Any]) -> tuple[list[dict[str, list]], dict[str, list[str]], list[str]]:
+    """
+    Convert YAML grid config to list of full configs.
+    Config may include a top-level 'param_order' key specifying the order params map to Trader.
+    If omitted, each symbol's param order is taken from the YAML key order.
+    Returns (combos, symbol_param_orders, symbols).
+    """
+    param_order = config.pop("param_order", None)
+    symbols = [k for k in config.keys() if isinstance(config[k], dict)]
+
+    symbol_combos = []
+    for symbol in symbols:
+        params = config[symbol]
+        param_names = [k for k in params.keys() if isinstance(params[k], (list, int, float))]
+        param_values = [
+            params[name] if isinstance(params[name], list) else [params[name]]
+            for name in param_names
+        ]
+        combos = []
+        for values in product(*param_values):
+            combo = dict(zip(param_names, values))
+            combos.append(combo)
+        symbol_combos.append((symbol, param_names, combos))
+
+    order = param_order if param_order is not None else None
+    symbol_param_orders = {sym: pnames for sym, pnames, _ in symbol_combos}
+    results = []
+    for combo_tuple in product(*[c[2] for c in symbol_combos]):
+        full_config = {}
+        for (symbol, param_names, _), combo in zip(symbol_combos, combo_tuple):
+            use_order = order if order is not None else param_names
+            full_config[symbol] = _config_to_trader_params(combo, use_order)
+        results.append(full_config)
+    return results, symbol_param_orders, symbols
+
+
+@app.command("grid-search")
+def grid_search(
+    algorithm: Annotated[Path, Argument(help="Path to the Python file containing the algorithm.", exists=True, file_okay=True, dir_okay=False, resolve_path=True)],
+    round_num: Annotated[int, Argument(help="Round number to backtest.")],
+    config: Annotated[Path, Option("--config", "-c", help="Path to YAML config file defining the param grid.", exists=True, file_okay=True, dir_okay=False, resolve_path=True)],
+    merge_pnl: Annotated[bool, Option("--merge-pnl", help="Merge profit and loss across days.")] = False,
+    data: Annotated[Optional[Path], Option(help="Path to data directory.", exists=True, file_okay=False, dir_okay=True, resolve_path=True)] = None,
+    out_csv: Annotated[Optional[Path], Option("--out-csv", help="Save all results to CSV file.")] = None,
+    no_progress: Annotated[bool, Option("--no-progress", help="Don't show progress bar.")] = False,
+) -> None:
+    """Grid search over Trader parameters to find the best configuration."""
+    try:
+        trader_module = parse_algorithm(algorithm)
+    except ModuleNotFoundError as e:
+        print(f"{algorithm} is not a valid algorithm file: {e}")
+        sys.exit(1)
+
+    if not hasattr(trader_module, "Trader"):
+        print(f"{algorithm} does not expose a Trader class")
+        sys.exit(1)
+
+    with config.open() as f:
+        grid_config = yaml.safe_load(f)
+
+    combos, symbol_param_orders, symbols = _grid_config_to_combos(grid_config)
+    print(f"Testing {len(combos)} parameter combinations...")
+
+    best_profit = float("-inf")
+    best_config = None
+    results_list = []
+
+    # iterator = tqdm(combos, ascii=True) if not no_progress else combos
+
+    for i, full_config in enumerate(combos):
+        reload(trader_module)
+        trader = trader_module.Trader(config=full_config)
+
+        result = run_backtest(
+            trader,
+            round_num,
+            data_path=data,
+            merge_pnl=merge_pnl,
+            print_output=False,
+            show_progress=False,
+        )
+
+        profit = result.profit
+        print(f"Config {(i + 1)} / {len(combos)}: {full_config}")
+        print(f"Profit {(i + 1)} / {len(combos)}: {profit:,.0f}")
+        results_list.append((full_config, profit))
+
+        if profit > best_profit:
+            best_profit = profit
+            best_config = full_config
+
+    print(f"\nBest config: {best_config}")
+    print(f"Best profit: {best_profit:,.0f}")
+
+    if out_csv is not None:
+        import csv
+
+        out_csv.parent.mkdir(parents=True, exist_ok=True)
+        with out_csv.open("w", newline="") as f:
+            writer = csv.writer(f)
+            header = []
+            for symbol in symbols:
+                for param in symbol_param_orders.get(symbol, []):
+                    header.append(f"{symbol}_{param}")
+            header.append("profit")
+            writer.writerow(header)
+
+            for full_config, profit in results_list:
+                row = []
+                for symbol in symbols:
+                    params = full_config.get(symbol, [])
+                    param_names = symbol_param_orders.get(symbol, [])
+                    for i in range(len(param_names)):
+                        row.append(params[i] if i < len(params) else "")
+                row.append(profit)
+                writer.writerow(row)
+        print(f"Results saved to {format_path(out_csv)}")
+
+
 def main() -> None:
+    # If first non-option arg is not a known command, treat as default "run"
+    args = [a for a in sys.argv[1:] if not a.startswith("-") or a in ("--help", "-h", "--version", "-v")]
+    if args and args[0] not in KNOWN_COMMANDS:
+        sys.argv.insert(1, "run")
     app()
 
 

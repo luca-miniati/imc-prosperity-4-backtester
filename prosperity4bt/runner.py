@@ -1,11 +1,15 @@
 import os
+from collections import defaultdict
 from contextlib import closing, redirect_stdout
+from functools import reduce
 from io import StringIO
+from pathlib import Path
+from typing import Optional
 
 from IPython.utils.io import Tee
 from tqdm import tqdm
 
-from prosperity4bt.data import LIMITS, BacktestData, read_day_data
+from prosperity4bt.data import LIMITS, BacktestData, has_day_data, read_day_data
 from prosperity4bt.datamodel import (
     ConversionObservation,
     Listing,
@@ -16,7 +20,7 @@ from prosperity4bt.datamodel import (
     Trade,
     TradingState,
 )
-from prosperity4bt.file_reader import FileReader
+from prosperity4bt.file_reader import FileReader, FileSystemReader, PackageResourcesReader
 from prosperity4bt.models import (
     ActivityLogRow,
     BacktestResult,
@@ -307,7 +311,7 @@ def match_orders(
         result.trades.extend([TradeRow(trade) for trade in remaining_market_trades])
 
 
-def run_backtest(
+def _run_backtest_single_day(
     trader,
     file_reader: FileReader,
     round_num: int,
@@ -378,3 +382,98 @@ def run_backtest(
         match_orders(state, data, orders, result, trade_matching_mode)
 
     return result
+
+
+def _merge_results(
+    a: BacktestResult, b: BacktestResult, merge_profit_loss: bool, merge_timestamps: bool
+) -> BacktestResult:
+    sandbox_logs = a.sandbox_logs[:]
+    activity_logs = a.activity_logs[:]
+    trades = a.trades[:]
+
+    a_last_timestamp = a.activity_logs[-1].timestamp if a.activity_logs else 0
+    if merge_timestamps:
+        timestamp_offset = a_last_timestamp + 100
+    else:
+        timestamp_offset = 0
+
+    sandbox_logs.extend([row.with_offset(timestamp_offset) for row in b.sandbox_logs])
+    trades.extend([row.with_offset(timestamp_offset) for row in b.trades])
+
+    if merge_profit_loss and a.activity_logs:
+        profit_loss_offsets = defaultdict(float)
+        for row in reversed(a.activity_logs):
+            if row.timestamp != a_last_timestamp:
+                break
+            profit_loss_offsets[row.columns[2]] = row.columns[-1]
+        activity_logs.extend(
+            [
+                row.with_offset(timestamp_offset, profit_loss_offsets.get(row.columns[2], 0))
+                for row in b.activity_logs
+            ]
+        )
+    else:
+        activity_logs.extend([row.with_offset(timestamp_offset, 0) for row in b.activity_logs])
+
+    return BacktestResult(a.round_num, a.day_num, sandbox_logs, activity_logs, trades)
+
+
+def run_backtest(
+    trader,
+    round_num: int,
+    *,
+    data_path: Optional[Path] = None,
+    merge_pnl: bool = False,
+    print_output: bool = False,
+    match_trades: TradeMatchingMode = TradeMatchingMode.all,
+    show_progress: bool = True,
+) -> BacktestResult:
+    """
+    Run backtest for a trader on all days in the specified round.
+
+    Args:
+        trader: Trader instance with a run(state) method.
+        round_num: Round number to backtest.
+        data_path: Path to data directory, or None for bundled data.
+        merge_pnl: If True and multiple days, merge profit/loss across days.
+        print_output: Print trader output to stdout.
+        match_trades: How to match orders against market trades.
+        show_progress: Show progress bar.
+
+    Returns:
+        BacktestResult with profit property for total PnL.
+    """
+    file_reader: FileReader = (
+        FileSystemReader(data_path) if data_path is not None else PackageResourcesReader()
+    )
+
+    parsed_days = []
+    for day_num in range(-5, 100):
+        if has_day_data(file_reader, round_num, day_num):
+            parsed_days.append((round_num, day_num))
+
+    if not parsed_days:
+        raise ValueError(f"No data found for round {round_num}")
+
+    results = []
+    for rnd, day in parsed_days:
+        result = _run_backtest_single_day(
+            trader,
+            file_reader,
+            rnd,
+            day,
+            print_output,
+            match_trades,
+            no_names=True,
+            show_progress_bar=show_progress and not print_output,
+        )
+        results.append(result)
+
+    if len(results) == 1:
+        return results[0]
+
+    merged = reduce(
+        lambda a, b: _merge_results(a, b, merge_pnl, merge_timestamps=True),
+        results,
+    )
+    return merged

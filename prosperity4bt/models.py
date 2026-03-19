@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, Dict
 
 import orjson
 
@@ -95,6 +95,33 @@ class BacktestResult:
     sandbox_logs: list[SandboxLogRow]
     activity_logs: list[ActivityLogRow]
     trades: list[TradeRow]
+
+    @property
+    def profit(self) -> float:
+        """Total profit from the last timestamp in activity_logs."""
+        if not self.activity_logs:
+            return 0.0
+        last_timestamp = self.activity_logs[-1].timestamp
+        total = 0.0
+        for row in reversed(self.activity_logs):
+            if row.timestamp != last_timestamp:
+                break
+            total += row.columns[-1]
+        return total
+
+    @property
+    def profit_by_symbol(self) -> Dict[str, float]:
+        """Total profit from the last timestamp in activity_logs."""
+        # if not self.activity_logs:
+        #     return {}
+        # last_timestamp = self.activity_logs[-1].timestamp
+        # total = 0.0
+        # for row in reversed(self.activity_logs):
+        #     if row.timestamp != last_timestamp:
+        #         break
+        #     total += row.columns[-1]
+        # return total
+        return {}
 
 
 @dataclass
